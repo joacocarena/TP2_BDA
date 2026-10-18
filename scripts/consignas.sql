@@ -717,4 +717,444 @@ GROUP BY c.highway
 ORDER BY longitud_km DESC;
 
 
+--12.1 Determinar qué porcentaje del departamento corresponde a:
+--áreas agrícolas;
+--otros usos.
+--La clasificación concreta dependerá de la información disponible en la capa seleccionada.
+
+WITH departamento AS (
+    SELECT ST_Union(geom) AS geom
+    FROM departamentos
+    WHERE nam ILIKE 'San Salvador'
+),
+suelos_recortados AS (
+    SELECT
+        CASE
+            WHEN s.ipc::numeric >= 20
+                THEN 'Potencial agrícola'
+            ELSE 'Otros suelos'
+        END AS clasificacion,
+        ST_Intersection(s.geom, d.geom) AS geom
+    FROM suelos s
+    CROSS JOIN departamento d
+    WHERE ST_Intersects(s.geom, d.geom)
+),
+superficies AS (
+    SELECT
+        clasificacion,
+        SUM(
+            ST_Area(geom::geography)
+        ) AS superficie_m2
+    FROM suelos_recortados
+    GROUP BY clasificacion
+),
+total_departamento AS (
+    SELECT
+        ST_Area(geom::geography) AS superficie_m2
+    FROM departamento
+)
+SELECT
+    s.clasificacion,
+    ROUND((s.superficie_m2 / 1000000)::numeric, 2)
+        AS superficie_km2,
+    ROUND(
+        (s.superficie_m2 * 100.0 /
+         NULLIF(t.superficie_m2, 0))::numeric,
+        2
+    ) AS porcentaje
+FROM superficies s
+CROSS JOIN total_departamento t;
+
+
+
+--12.2
+--Identificar sectores de uso agrícola que se encuentren dentro de la Zona de Riesgo Hídrico
+--definida anteriormente.
+--El objetivo será realizar una primera aproximación a las posibles áreas productivas expuestas.
+WITH departamento AS (
+    SELECT ST_Union(geom) AS geom
+    FROM departamentos
+    WHERE nam ILIKE 'San Salvador'
+),
+suelos_recortados AS (
+    SELECT
+        s.nombre,
+        s.ipc,
+        ST_Intersection(s.geom, d.geom) AS geom
+    FROM suelos s
+    CROSS JOIN departamento d
+    WHERE ST_Intersects(s.geom, d.geom)
+      AND s.ipc::numeric >= 20
+),
+suelos_en_riesgo AS (
+    SELECT
+        s.nombre,
+        s.ipc,
+        ST_CollectionExtract(
+            ST_Intersection(s.geom, z.geom), 3
+        ) AS geom
+    FROM suelos_recortados s
+    JOIN zona_riesgo_hidrico z
+        ON ST_Intersects(s.geom, z.geom)
+)
+SELECT
+    nombre,
+    ipc,
+    ROUND(
+        (
+            SUM(ST_Area(geom::geography)) / 1000000
+        )::numeric, 2
+    ) AS superficie_expuesta_km2
+FROM suelos_en_riesgo
+WHERE NOT ST_IsEmpty(geom)
+GROUP BY nombre, ipc
+ORDER BY superficie_expuesta_km2 DESC;
+
+
+
+--12.3
+--Calcular la intersección entre las principales rutas y las áreas agrícolas.
+--Identificar aquellos sectores donde exista una relación directa entre:
+--producción agrícola + red vial
+--y analizar su posible importancia como corredores productivos.
+
+WITH departamento AS (
+    SELECT ST_Union(geom) AS geom
+    FROM departamentos
+    WHERE nam ILIKE 'San Salvador'
+),
+suelos_recortados AS (
+    SELECT
+        s.nombre,
+        s.ipc,
+        ST_Intersection(s.geom, d.geom) AS geom
+    FROM suelos s
+    CROSS JOIN departamento d
+    WHERE ST_Intersects(s.geom, d.geom)
+      AND s.ipc::numeric >= 20
+),
+rutas_recortadas AS (
+    SELECT
+        ST_CollectionExtract(
+            ST_Intersection(r.geom, d.geom), 2
+        ) AS geom
+    FROM rutas r
+    CROSS JOIN departamento d
+    WHERE ST_Intersects(r.geom, d.geom)
+),
+corredores AS (
+    SELECT
+        s.nombre,
+        s.ipc,
+        ST_CollectionExtract(
+            ST_Intersection(r.geom, s.geom), 2
+        ) AS geom
+    FROM rutas_recortadas r
+    JOIN suelos_recortados s
+        ON ST_Intersects(r.geom, s.geom)
+)
+SELECT
+    nombre AS unidad_suelo,
+    ipc,
+    ROUND(
+        (
+            SUM(ST_Length(geom::geography)) / 1000
+        )::numeric, 2
+    ) AS longitud_rutas_km
+FROM corredores
+WHERE NOT ST_IsEmpty(geom)
+GROUP BY nombre, ipc
+ORDER BY longitud_rutas_km DESC;
+
+
+
+
+
+-- 13. Reasignación sanitaria ante inundación
+-- Paso 0: Zona de Riesgo Hídrico (2 km, ítem 9.1)
+
+
+DROP TABLE IF EXISTS zona_riesgo_hidrico;
+
+
+CREATE TABLE zona_riesgo_hidrico AS
+SELECT 1 AS id,
+       ST_Multi(ST_Union(ST_Buffer(ST_MakeValid(g)::geography, 2000)::geometry))::geometry(MultiPolygon,4326) AS geom
+FROM (
+    SELECT geom AS g FROM rios
+    UNION ALL
+    SELECT geom FROM lagunas
+) h;
+
+
+CREATE INDEX ON zona_riesgo_hidrico USING gist (geom);
+
+
+-- Paso 1: reasignación por localidad
+DROP TABLE IF EXISTS emergencia_reasignacion;
+CREATE TABLE emergencia_reasignacion AS
+WITH loc AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY osm_id) AS id,
+           name AS localidad, population,
+           ST_PointOnSurface(geom) AS pt
+    FROM localidades
+),
+sal AS (
+    SELECT COALESCE(s.name, s.official_n) AS establecimiento,
+           ST_PointOnSurface(s.geom) AS pt,
+           EXISTS (SELECT 1 FROM zona_riesgo_hidrico z
+                   WHERE ST_Intersects(z.geom, s.geom)) AS en_riesgo
+    FROM salud s
+)
+SELECT
+    l.id,
+    l.localidad,
+    l.population,
+    EXISTS (SELECT 1 FROM zona_riesgo_hidrico z
+            WHERE ST_Intersects(z.geom, l.pt))            AS localidad_en_riesgo,
+    n.establecimiento                                      AS est_habitual,
+    ROUND(n.dist::numeric)                                 AS dist_habitual_m,
+    n.en_riesgo                                            AS habitual_inutilizable,
+    a.establecimiento                                      AS est_alternativo,
+    ROUND(a.dist::numeric)                                 AS dist_alternativo_m,
+    ROUND((a.dist - n.dist)::numeric)                      AS aumento_m,
+    (SELECT COUNT(*) FROM rios r
+      WHERE ST_Intersects(r.geom, ST_MakeLine(l.pt, a.pt))) AS cursos_cruzados,
+    ROUND(rt.d::numeric)                                   AS dist_a_ruta_m,
+    ST_MakeLine(l.pt, a.pt)::geometry(LineString,4326)     AS geom
+FROM loc l
+CROSS JOIN LATERAL (
+    SELECT s.establecimiento, s.en_riesgo,
+           ST_Distance(l.pt::geography, s.pt::geography) AS dist
+    FROM sal s ORDER BY dist LIMIT 1
+) n
+LEFT JOIN LATERAL (
+    SELECT s.establecimiento, s.pt,
+           ST_Distance(l.pt::geography, s.pt::geography) AS dist
+    FROM sal s WHERE NOT s.en_riesgo ORDER BY dist LIMIT 1
+) a ON true
+LEFT JOIN LATERAL (
+    SELECT ST_Distance(l.pt::geography, r.geom::geography) AS d
+    FROM rutas r ORDER BY d LIMIT 1
+) rt ON true;
+
+
+ALTER TABLE emergencia_reasignacion ADD PRIMARY KEY (id);
+
+
+SELECT * FROM emergencia_reasignacion ORDER BY aumento_m DESC NULLS FIRST;
+
+
+-----------------------------------------------------------15
+
+DROP TABLE IF EXISTS candidatos_centro_emergencia;
+
+CREATE TABLE candidatos_centro_emergencia AS
+
+WITH departamento AS (
+    SELECT ST_Union(geom) AS geom
+    FROM departamentos
+    WHERE nam ILIKE 'San Salvador'
+),
+
+-- 1. Recortar rutas al departamento
+rutas_depto AS (
+    SELECT
+        (ST_Dump(
+            ST_CollectionExtract(
+                ST_Intersection(r.geom, d.geom), 2
+            )
+        )).geom AS geom
+    FROM rutas r
+    CROSS JOIN departamento d
+    WHERE ST_Intersects(r.geom, d.geom)
+),
+
+-- 2. Generar puntos cada 2 km sobre las rutas
+puntos AS (
+    SELECT
+        ST_LineInterpolatePoint(
+            r.geom,
+            n.i::double precision /
+            GREATEST(
+                1,
+                CEIL(
+                    ST_Length(r.geom::geography) / 2000.0
+                )::integer
+            )
+        ) AS geom
+    FROM rutas_depto r
+    CROSS JOIN LATERAL generate_series(
+        0,
+        GREATEST(
+            1,
+            CEIL(
+                ST_Length(r.geom::geography) / 2000.0
+            )::integer
+        )
+    ) AS n(i)
+),
+
+-- 3. Crear un entorno de 100 metros
+areas AS (
+    SELECT
+        p.geom,
+        ST_Buffer(
+            p.geom::geography, 100
+        )::geometry AS area
+    FROM puntos p
+),
+
+-- 4. Descartar zonas inadecuadas
+candidatos AS (
+    SELECT a.geom, a.area
+    FROM areas a
+    CROSS JOIN departamento d
+    WHERE ST_CoveredBy(a.area, d.geom)
+
+    AND NOT EXISTS (
+        SELECT 1
+        FROM zona_riesgo_hidrico z
+        WHERE ST_Intersects(a.area, z.geom)
+    )
+
+    AND NOT EXISTS (
+        SELECT 1
+        FROM rios r
+        WHERE ST_Intersects(a.area, r.geom)
+    )
+
+    AND NOT EXISTS (
+        SELECT 1
+        FROM lagunas l
+        WHERE ST_Intersects(a.area, l.geom)
+    )
+
+    AND NOT EXISTS (
+        SELECT 1
+        FROM suelos s
+        WHERE s.ipc::numeric >= 20
+          AND ST_Intersects(a.area, s.geom)
+    )
+),
+
+-- 5. Medir accesibilidad sanitaria actual
+localidades_salud AS (
+    SELECT
+        l.name,
+        ST_PointOnSurface(l.geom) AS geom,
+        (
+            SELECT MIN(
+                ST_Distance(
+                    ST_PointOnSurface(l.geom)::geography,
+                    ST_PointOnSurface(s.geom)::geography
+                )
+            )
+            FROM salud s
+        ) AS distancia_salud_m
+    FROM localidades l
+    CROSS JOIN departamento d
+    WHERE ST_Intersects(l.geom, d.geom)
+),
+
+-- 6. Evaluar candidatos
+evaluacion AS (
+    SELECT
+        c.geom,
+        c.area,
+
+        (
+            SELECT COUNT(*)
+            FROM localidades_salud l
+            WHERE ST_DWithin(
+                c.geom::geography,
+                l.geom::geography,
+                30000
+            )
+        ) AS localidades_cercanas,
+
+        (
+            SELECT COUNT(*)
+            FROM localidades_salud l
+            WHERE l.distancia_salud_m > 5000
+              AND ST_DWithin(
+                  c.geom::geography,
+                  l.geom::geography,
+                  30000
+              )
+        ) AS localidades_mal_atendidas,
+
+        (
+            SELECT MIN(
+                ST_Distance(
+                    c.geom::geography,
+                    l.geom::geography
+                )
+            )
+            FROM localidades_salud l
+        ) AS distancia_localidad_m,
+
+        (
+            SELECT MIN(
+                ST_Distance(
+                    c.geom::geography,
+                    ST_PointOnSurface(s.geom)::geography
+                )
+            )
+            FROM salud s
+        ) AS distancia_salud_m
+
+    FROM candidatos c
+)
+
+-- 7. Seleccionar los 5 mejores
+SELECT
+    ROW_NUMBER() OVER (
+        ORDER BY
+            localidades_mal_atendidas DESC,
+            localidades_cercanas DESC,
+            distancia_localidad_m ASC
+    ) AS id,
+
+    localidades_cercanas,
+    localidades_mal_atendidas,
+
+    ROUND(distancia_localidad_m::numeric)
+        AS distancia_localidad_m,
+
+    ROUND(distancia_salud_m::numeric)
+        AS distancia_salud_m,
+
+    ROUND(
+        (ST_Area(area::geography) / 10000)::numeric,
+        2
+    ) AS entorno_ha,
+
+    geom,
+    area AS zona_geom
+
+FROM evaluacion
+
+ORDER BY
+    localidades_mal_atendidas DESC,
+    localidades_cercanas DESC,
+    distancia_localidad_m ASC
+
+LIMIT 5;
+
+SELECT
+    id,
+    localidades_cercanas,
+    localidades_mal_atendidas,
+    distancia_localidad_m,
+    distancia_salud_m,
+    entorno_ha
+FROM candidatos_centro_emergencia
+ORDER BY id;
+
+
+
+
+
+select * from suelo_clasificado
 
